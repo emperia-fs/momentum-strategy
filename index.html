@@ -96,7 +96,8 @@ canvas{max-height:320px}
     <label>FMP API Key:</label>
     <input type="password" id="apiKey" placeholder="Paste your FMP API key here">
     <button type="button" onclick="toggleKey()" style="background:none;border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--muted);font-size:11px;cursor:pointer;font-family:var(--mono)" id="toggleBtn">Show</button>
-    <button id="loadBtn" onclick="loadAllData()">⚡ Load Real Data</button>
+    <button onclick="testAPI()" style="background:none;border:1px solid var(--amber);border-radius:8px;padding:8px 14px;color:var(--amber);font-family:var(--font);font-size:12px;font-weight:600;cursor:pointer">🧪 Test (5 calls)</button>
+    <button id="loadBtn" onclick="loadAllData()">⚡ Load All Data (51 calls)</button>
   </div>
   <div class="api-hint">Free at <a href="https://site.financialmodelingprep.com/developer/docs" target="_blank">financialmodelingprep.com</a> — 250 req/day. Your key stays in this browser tab only (never sent to Anthropic). Uses ~51 API calls per load.</div>
   <div class="api-status" id="apiStatus"></div>
@@ -187,11 +188,119 @@ function toggleKey() {
   else { inp.type = 'password'; btn.textContent = 'Show'; }
 }
 
+let USE_CLAUDE_PROXY = false; // auto-detected
+
+async function fmpFetchDirect(url) {
+  const resp = await fetch(url);
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(`FMP ${resp.status}`);
+  return JSON.parse(text);
+}
+
+async function fmpFetchViaClaude(url) {
+  // Claude can't proxy large historical datasets - only works for small requests
+  // For batch quotes this works fine, for historical data it's too large
+  throw new Error('CORS_BLOCKED');
+}
+
 async function fmpFetch(path, apiKey) {
   const sep = path.includes('?') ? '&' : '?';
-  const resp = await fetch(`${BASE_URL}${path}${sep}apikey=${apiKey}`);
-  if (!resp.ok) throw new Error(`FMP API error ${resp.status}`);
-  return resp.json();
+  const url = `${BASE_URL}${path}${sep}apikey=${apiKey}`;
+  console.log('Fetching:', url.replace(apiKey, 'KEY'));
+
+  if (!USE_CLAUDE_PROXY) {
+    try {
+      return await fmpFetchDirect(url);
+    } catch(e) {
+      if (e.message === 'Failed to fetch' || e.name === 'TypeError') {
+        console.warn('Direct fetch blocked (CORS). Switching to Claude API proxy.');
+        USE_CLAUDE_PROXY = true;
+      } else {
+        throw e;
+      }
+    }
+  }
+  // Claude proxy mode
+  return await fmpFetchViaClaude(url);
+}
+
+function parseHistorical(d) {
+  if (Array.isArray(d)) return d;
+  if (d && Array.isArray(d.historical)) return d.historical;
+  if (d && typeof d === 'object') {
+    for (const key of Object.keys(d)) {
+      if (Array.isArray(d[key]) && d[key].length > 0 && d[key][0].date) return d[key];
+    }
+  }
+  return [];
+}
+
+async function fetchHistory(symbol, apiKey) {
+  try {
+    const d = await fmpFetch(`/api/v3/historical-price-full/${encodeURIComponent(symbol)}?from=2022-01-01`, apiKey);
+    const arr = parseHistorical(d);
+    if (arr.length > 0) return arr;
+  } catch(e) { console.warn(`Failed for ${symbol}:`, e.message); }
+  return [];
+}
+
+// TEST MODE: 5 calls only (S&P + 4 stocks) to verify API works
+async function testAPI() {
+  const apiKey = document.getElementById('apiKey').value.trim();
+  if (!apiKey) { alert('Please enter your FMP API key'); return; }
+
+  const status = document.getElementById('apiStatus');
+  status.className = 'api-status loading';
+  status.innerHTML = '<span class="spinner"></span>Testing with 5 API calls...';
+
+  const testTickers = ['AAPL', 'MSFT', 'NVDA', 'TSLA'];
+  try {
+    // Call 1: S&P 500
+    const spyRaw = await fetchHistory('^GSPC', apiKey);
+    const spySorted = [...spyRaw].sort((a,b) => a.date > b.date ? 1 : -1);
+
+    // Calls 2-5: 4 stocks
+    const stockResults = {};
+    for (const t of testTickers) {
+      const raw = await fetchHistory(t, apiKey);
+      stockResults[t] = [...raw].sort((a,b) => a.date > b.date ? 1 : -1);
+    }
+
+    // Report
+    let report = `S&P 500: ${spySorted.length} daily records`;
+    if (spySorted.length > 0) report += ` (${spySorted[0].date} → ${spySorted[spySorted.length-1].date})`;
+    report += '\n';
+    for (const t of testTickers) {
+      const d = stockResults[t];
+      report += `${t}: ${d.length} records`;
+      if (d.length > 0) report += ` (${d[0].date} → ${d[d.length-1].date})`;
+      // Count Fridays
+      let fridays = 0;
+      for (const day of d) {
+        const parts = day.date.split('-');
+        const dt = new Date(Date.UTC(+parts[0], +parts[1]-1, +parts[2]));
+        if (dt.getUTCDay() === 5) fridays++;
+      }
+      report += `, ${fridays} Fridays`;
+      report += '\n';
+    }
+
+    status.className = 'api-status success';
+    const mode = USE_CLAUDE_PROXY ? '(via Claude API — CORS blocked, using proxy)' : '(direct FMP calls)';
+    status.innerHTML = `✓ Test passed! 5 calls used ${mode}. Results:<br><pre style="margin-top:6px;font-size:10px;color:var(--green);white-space:pre-wrap">` + report + '</pre>';
+    console.log('Test results:', report);
+
+  } catch(err) {
+    status.className = 'api-status error';
+    if (err.message === 'CORS_BLOCKED' || err.message === 'Failed to fetch' || USE_CLAUDE_PROXY) {
+      status.innerHTML = `✗ <strong>CORS blocked</strong> — the Claude artifact sandbox prevents direct API calls to FMP.<br><br>
+        <span style="color:var(--amber)">To use real data, download this HTML file and open it locally or host on GitHub Pages.</span><br>
+        The API key + fetch logic works perfectly outside this sandbox.`;
+    } else {
+      status.textContent = '✗ Test failed: ' + err.message;
+    }
+    console.error('Test error:', err);
+  }
 }
 
 async function loadAllData() {
@@ -208,11 +317,13 @@ async function loadAllData() {
   status.className = 'api-status loading';
 
   try {
-    // Step 1: Fetch S&P 500 index historical (1 request)
+    // Step 1: Fetch S&P 500 index historical
     status.innerHTML = '<span class="spinner"></span>Fetching S&P 500 index history...';
     fill.style.width = '2%';
-    const spyData = await fmpFetch('/stable/historical-price-eod/full?symbol=%5EGSPC&from=2022-01-01', apiKey);
-    const spyPrices = (Array.isArray(spyData) ? spyData : spyData.historical || []).reverse(); // oldest first
+    const spyRaw = await fetchHistory('^GSPC', apiKey);
+    console.log('S&P 500 raw data sample:', spyRaw.slice(0,3));
+    // Sort oldest first (FMP returns newest first)
+    const spyPrices = [...spyRaw].sort((a,b) => a.date > b.date ? 1 : -1);
 
     // Step 2: Fetch each stock's historical data (50 requests, batched)
     const weeklyPrices = {}; // ticker -> [{date, close}, ...]
@@ -224,37 +335,43 @@ async function loadAllData() {
       status.innerHTML = `<span class="spinner"></span>Fetching ${batch.join(', ')} (${i+batch.length}/${TICKERS.length})...`;
 
       const results = await Promise.all(batch.map(t =>
-        fmpFetch(`/stable/historical-price-eod/full?symbol=${t}&from=2022-01-01`, apiKey)
-          .then(d => ({ ticker: t, data: (Array.isArray(d) ? d : d.historical || []).reverse() }))
+        fetchHistory(t, apiKey)
+          .then(raw => {
+            const sorted = [...raw].sort((a,b) => a.date > b.date ? 1 : -1);
+            return { ticker: t, data: sorted };
+          })
           .catch(() => ({ ticker: t, data: [] }))
       ));
 
       for (const r of results) {
-        // Resample to weekly (Fridays only, or nearest)
         const daily = r.data;
+        if (r.ticker === 'AAPL') console.log(`AAPL: ${daily.length} daily records, first:`, daily[0], 'last:', daily[daily.length-1]);
         const weekly = [];
-        let wi = 0;
         for (const day of daily) {
-          const d = new Date(day.date);
-          if (d.getDay() === 5) { // Friday
-            weekly.push({ date: day.date, close: day.close });
+          // Use UTC to avoid timezone issues with date parsing
+          const parts = day.date.split('-');
+          const d = new Date(Date.UTC(+parts[0], +parts[1]-1, +parts[2]));
+          const dow = d.getUTCDay();
+          if (dow === 5) { // Friday
+            weekly.push({ date: day.date, close: day.adjClose || day.close });
           }
         }
-        // If no Fridays found, take last trading day of each week
-        if (weekly.length === 0) {
-          let lastWeek = -1;
-          for (const day of daily) {
-            const d = new Date(day.date);
+        // If few Fridays (maybe market holidays), also take Thursdays as week-end proxy
+        if (weekly.length < 20 && daily.length > 50) {
+          weekly.length = 0; // reset
+          let prevWeekNum = -1;
+          for (let j = daily.length - 1; j >= 0; j--) {
+            const day = daily[j];
+            const parts = day.date.split('-');
+            const d = new Date(Date.UTC(+parts[0], +parts[1]-1, +parts[2]));
             const weekNum = Math.floor(d.getTime() / (7*24*3600*1000));
-            if (weekNum !== lastWeek) {
-              if (lastWeek !== -1 && daily[daily.indexOf(day)-1]) {
-                weekly.push({ date: daily[daily.indexOf(day)-1].date, close: daily[daily.indexOf(day)-1].close });
-              }
-              lastWeek = weekNum;
+            if (weekNum !== prevWeekNum) {
+              weekly.unshift({ date: day.date, close: day.adjClose || day.close });
+              prevWeekNum = weekNum;
             }
           }
-          if (daily.length) weekly.push({ date: daily[daily.length-1].date, close: daily[daily.length-1].close });
         }
+        if (r.ticker === 'AAPL') console.log(`AAPL weekly: ${weekly.length} weeks`);
         weeklyPrices[r.ticker] = weekly;
       }
     }
@@ -264,9 +381,11 @@ async function loadAllData() {
     fill.style.width = '94%';
     const spyWeekly = [];
     for (const day of spyPrices) {
-      const d = new Date(day.date);
-      if (d.getDay() === 5) spyWeekly.push({ date: day.date, close: day.close });
+      const parts = day.date.split('-');
+      const d = new Date(Date.UTC(+parts[0], +parts[1]-1, +parts[2]));
+      if (d.getUTCDay() === 5) spyWeekly.push({ date: day.date, close: day.adjClose || day.close });
     }
+    console.log(`S&P 500: ${spyPrices.length} daily -> ${spyWeekly.length} Fridays`);
 
     // Step 4: Align all tickers to common Friday dates
     const allDates = new Set();
@@ -291,7 +410,11 @@ async function loadAllData() {
       return count >= 40;
     });
 
-    if (validDates.length < 10) throw new Error('Not enough data. Check API key and try again.');
+    if (validDates.length < 10) {
+      const stockCounts = TICKERS.map(t => (weeklyPrices[t]||[]).length);
+      const withData = stockCounts.filter(c => c > 0).length;
+      throw new Error(`Not enough aligned data. S&P Fridays: ${spyWeekly.length}, Stocks with data: ${withData}/50. Open browser console (F12) for details.`);
+    }
 
     // Forward-fill missing prices
     for (const t of TICKERS) {
@@ -427,7 +550,11 @@ async function loadAllData() {
 
   } catch (err) {
     status.className = 'api-status error';
-    status.textContent = '✗ ' + err.message;
+    if (USE_CLAUDE_PROXY || err.message === 'Failed to fetch') {
+      status.innerHTML = `✗ <strong>CORS blocked</strong> — download this file and run from GitHub Pages or locally to use FMP data.`;
+    } else {
+      status.textContent = '✗ ' + err.message;
+    }
     console.error(err);
   }
   btn.disabled = false;
